@@ -6,8 +6,9 @@ import datetime
 from influxdb import InfluxDBClient
 from statistics import mean
 
+client = InfluxDBClient(host='127.0.0.1', port=8086, database='noaa')
 pp = pprint.PrettyPrinter(indent=4)
-DIR = "/home/leaf/Downloads/noaa/2017/2017out/"
+DIR = "/home/leaf/Downloads/noaa/"
 
 def send_to_influx(data):
     for station in data:
@@ -22,10 +23,9 @@ def send_to_influx(data):
         if data[station]["ST"]:
             metrics['tags']['state'] = data[station]["ST"]
         for year in data[station]["TEMPS"].keys():
-            metrics['time'] = time.mktime(datetime.datetime.strptime(year, "%Y").timetuple())
-            metrics['fields']["value"] = data[station]["TEMPS"][year]
-      #  print(data[station]["TEMPS"].keys())
-        print(metrics)
+            metrics['time'] = year + "-01-01T00:00:00Z00:00"
+            metrics['fields']["value"] = float(data[station]["TEMPS"][year])
+        client.write_points([metrics])
 
 def get_station_info(usaf_num):
     station_dict = {}
@@ -59,103 +59,79 @@ def divide_station_line(line):
         line_entry[i] = line_entry[i].strip()
     return line_entry
 
+def parse_data_date(line):
+    ymd = line[13:21]
+    return ymd
+
+
 info_list = []
-for filename in os.listdir(DIR):
-    print("NEW FILE!!!")
-    if os.path.isdir(DIR + filename):
+infodict = {}
+for filename in os.listdir(DIR+"2017/2017out/"):
+    if os.path.isdir(DIR + "2017/2017out/" + filename):
        # print(filename, "is a directory, skipping...")
         continue
-    with open(DIR + filename) as file:
-        data = file.readline()
+    with open(DIR + "2017/2017out/" + filename) as file:
+        data = file.readlines()[1:]
+        first = True
+        prev_date = ""
         all_temps = []
-        while(data):
-            data = file.readline()
-         #   print(data)
-            year_s = data[13:17]
-            month_s = data[17:19]
-            day_s = data[19:21]
-
-            year = data[13:17]
-            month = data[17:19]
-            day = data[19:21]
-            day_temps = []
-            while year == year_s and month == month_s and day == day_s:
-             #   print(data)
-                #print(len(data))
-                temp = "not an int"
-
+        for line in data:
+            date = parse_data_date(line)
+            if first:
+                prev_date = date
+                first = False
+                day_temps = []
+            if date == prev_date:
+                # check to see if there's a valid temperature in the line
                 try:
-                    temp = int(data[83:88], 16)
+                    temp = int(line[83:88], 16)
                 except ValueError:
-                    data = file.readline()
-                    if not data:
-                        break
-                    year = data[13:17]
-                    month = data[17:19]
-                    day = data[19:21]
-
-
-                if type(temp) is int:
-                    day_temps.append(temp)
-
-
-
-                data = file.readline()
-                if not data:
-                    break
-
-                year = data[13:17]
-                month = data[17:19]
-                day = data[19:21]
-            day_temps.sort()
-            coldest_day_temps = day_temps[0:3]
-          #  print(coldest_day_temps)
-            if len(coldest_day_temps) < 3:
-                continue
-            try:
-                all_temps.append(mean(coldest_day_temps))
-            except:
-                continue
-            all_temps.sort()
-        if not all_temps:
-            continue
+                    continue
+                # intake another line once we got the temperature
+                # check if we've reached the end of the file yet
+                day_temps.append(temp)
+                # sort all the temperatures from the day we've collected
+            else:
+                # keep the three lowest temps
+                day_temps.sort()
+                coldest_day_temps = day_temps[0:3]
+                day_temps = []
+                if any(coldest_day_temps):
+                    all_temps.append(mean(coldest_day_temps))
+                # add the mean day temperature to the list of all day temps
+                first = True
+        # sort all the year's daily temperatures
+        all_temps.sort()
+        # if there's not any reported temperatures, we can skip this file
+        if not any(all_temps):
+            break
+        # get a week's worth of coldest temps
         min_avg_temp = mean(all_temps[0:7])
-            #print(min(month_temps))
 
         station_info = filename.strip('.out').split('-')
         station_info.append(min_avg_temp)
-        print(station_info)
-        if not info_list:
-            info_list.append({station_info[0]: {"TEMPS": {station_info[2]: station_info[3]}}})
-        for station_dict in info_list:
-            if station_info[0] in station_dict.keys():
-                station_dict[station_info[0]]["TEMPS"][station_info[2]] = station_info[3]
-            else:
-                info_list.append({station_info[0]: {"TEMPS": {station_info[2]: station_info[3]}}})
-     #   print(info_list)
 
-infodict = {}
+        infodict[station_info[0]] = {"TEMPS": {station_info[2]: station_info[3]}}
+
+#infodict = {}
 tempdict = {}
-for station in info_list:
-    usaf = station.keys()
-    for key in usaf:
-        tempdict = get_station_info(key)
-        lat = None
-        lon = None
-        if tempdict["LAT"]:
-            tempdict["LAT"] = float(tempdict["LAT"][1:])
-            lat = tempdict["LAT"]
-        if tempdict["LON"]:
-            tempdict["LON"] = float(tempdict["LON"][1:])
-            lon = tempdict["LON"]
-        if tempdict["ELEV(M)"]:
-            tempdict["ELEV(M)"] = float(tempdict["ELEV(M)"][1:])
-        if lat and lon:
-            geohash = pygeohash.encode(lat, lon)
-            tempdict["GEOHASH"] = geohash
-        for k, v in station[key].items():
-            tempdict[k] = v
-        infodict[key] = tempdict
-pp.pprint(infodict)
+for key in infodict.keys():
+    tempdict = get_station_info(key)
+    lat = None
+    lon = None
+    if tempdict["LAT"]:
+        tempdict["LAT"] = float(tempdict["LAT"][1:])
+        lat = tempdict["LAT"]
+    if tempdict["LON"]:
+        tempdict["LON"] = float(tempdict["LON"][1:])
+        lon = tempdict["LON"]
+    if tempdict["ELEV(M)"]:
+        tempdict["ELEV(M)"] = float(tempdict["ELEV(M)"][1:])
+    if lat and lon:
+        geohash = pygeohash.encode(lat, lon)
+        tempdict["GEOHASH"] = geohash
+    for k, v in infodict[key].items():
+        tempdict[k] = v
+    infodict[key] = tempdict
 
 send_to_influx(infodict)
