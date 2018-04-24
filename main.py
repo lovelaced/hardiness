@@ -254,7 +254,7 @@ with open("world.json") as worldjson:
                     continue
                 polygon2 = shape(p["geometry"])
                 try:
-                    newpoly = polygon.intersection(polygon2)
+                    newpoly = polygon.buffer(0.0).intersection(polygon2.buffer(0.0))
                 except shapely.errors.TopologicalError as error:
                     print(error)
                     continue
