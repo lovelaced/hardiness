@@ -5,15 +5,17 @@ import datetime
 from influxdb import InfluxDBClient
 from statistics import mean
 import folium
+import json
+import shapely.errors
+from shapely.geometry import shape
 import pandas as pd
 from geojson import FeatureCollection, Feature, Polygon
-import matplotlib.pyplot as plt
-from scipy.spatial import Voronoi, voronoi_plot_2d
+from scipy.spatial import Voronoi
 
 client = InfluxDBClient(host='127.0.0.1', port=8086, database='noaa')
 pp = pprint.PrettyPrinter(indent=4)
 DIR = "/home/leaf/Downloads/noaa/"
-mapVor = folium.Map(location=[40.75, -73.9],zoom_start=2)
+mapVor = folium.Map(location=[40.75, -73.9], zoom_start=2)
 
 def send_dict_to_influx(data):
     for station in data:
@@ -92,7 +94,13 @@ def parse_data_date(line):
 
 
 def parse_data_temp(line):
-    temp = int(line[83:88], 16)
+    unadj_temp = int(line[83:88])
+    temp = unadj_temp
+    alt = line[100:106]
+    if not '*' in alt:
+        alt = float(alt)
+        if alt > 400:
+            temp = unadj_temp - alt/float(1000)*3.5
     return temp
 
 
@@ -174,12 +182,16 @@ for key in infodict.keys():
     if tempdict["LON"]:
         tempdict["LON"] = float(tempdict["LON"])
         lon = tempdict["LON"]
-    if tempdict["ELEV(M)"]:
-        tempdict["ELEV(M)"] = float(tempdict["ELEV(M)"][1:])
     if lat and lon:
         geohash = pygeohash.encode(lat, lon)
         tempdict["GEOHASH"] = geohash
         coorddict[tempdict["STATION NAME"]] = {"lat": lat, "lon": lon, "temp": mean(infodict[key]["YEARLY_TEMPS"].values())}
+    if tempdict["ELEV(M)"]:
+        elevation = float(tempdict["ELEV(M)"][1:])
+        tempdict["ELEV(M)"] = elevation
+        for year in infodict[key]["YEARLY_TEMPS"].keys():
+            infodict[key]["YEARLY_TEMPS"] = infodict[key]["YEARLY_TEMPS"][year] - (elevation/float(1000) * 3.5)
+
     else:
         tempdict["GEOHASH"] = False
     for k, v in infodict[key].items():
@@ -214,7 +226,7 @@ for region in range(len(vor.regions)-1):
     #Save the vertex list as a polygon and then add to the feature_list:
     polygon = Polygon([vertex_list])
     for entry in coorddict.keys():
-        print(i, vor.points[i][0], vor.points[i][1], str(coorddict[entry]["lat"]), str(coorddict[entry]["lon"]))
+#        print(i, vor.points[i][0], vor.points[i][1], str(coorddict[entry]["lat"]), str(coorddict[entry]["lon"]))
         if vor.points[i][0] == coorddict[entry]["lat"] and vor.points[i][1] == coorddict[entry]["lon"]:
             id = entry
             break
@@ -223,23 +235,42 @@ for region in range(len(vor.regions)-1):
         exit(1)
     feature = Feature(geometry=polygon, properties={"id": id})
     feature_list.append(feature)
-    i+=1
+    i += 1
+
+# create a new feature list with just the intersections of our world map land boundaries and our created polygons
+bordered_feature_list = list()
+with open("world.json") as worldjson:
+    countries = json.loads(worldjson.read())
+    for country in countries["features"]:
+        border = country["geometry"]
+        polygon = shape(border)
+        if polygon:
+            for p in feature_list:
+                try:
+                    polycoords = p["geometry"]["coordinates"]
+                    if len(polycoords[0]) < 3:
+                        continue
+                except:
+                    continue
+                polygon2 = shape(p["geometry"])
+                try:
+                    newpoly = polygon.intersection(polygon2)
+                except shapely.errors.TopologicalError as error:
+                    print(error)
+                    continue
+                feature = Feature(geometry=newpoly, properties={"id": p["properties"]["id"]})
+                bordered_feature_list.append(feature)
 
 #Write the features to the new file:
-feature_collection = FeatureCollection(feature_list)
+feature_collection = FeatureCollection(bordered_feature_list)
 print(feature_collection, file=vorJSON)
 vorJSON.close()
 
-#try:
-#    folium.CircleMarker([lat, lon], radius=5, popup=folium.Popup(tempdict['STATION NAME'], parse_html=True)).add_to(mapVor)
-#          hcol = colorgrad(-100, 150, infodict[key]['YEARLY_TEMPS']['2017'])
-#except:
- #   print("oops")
 
 #Add the voronoi layer to the map:
 #folium.GeoJson('libVor.json', name="geojson").add_to(mapVor)
 pd_stations = pd.read_csv('station_temps.csv', sep='\s*,\s*', encoding="utf-8-sig", delimiter=',')
-print(pd_stations)
+#print(pd_stations)
 mapVor.choropleth(geo_data='libVor.json', data=pd_stations, columns=['id', 'temp'], key_on='properties.id', fill_color="YlGn", fill_opacity=0.45, line_opacity=0.1)
 folium.LayerControl().add_to(mapVor)
 mapVor.save(outfile='libVor.html')
