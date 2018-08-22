@@ -7,6 +7,9 @@ from statistics import mean
 import folium
 import json
 import shapely.errors
+import numpy as np
+import sys
+from pymongo import MongoClient
 from shapely.geometry import shape
 import pandas as pd
 from geojson import FeatureCollection, Feature, Polygon
@@ -16,6 +19,19 @@ client = InfluxDBClient(host='127.0.0.1', port=8086, database='noaa')
 pp = pprint.PrettyPrinter(indent=4)
 DIR = "/home/leaf/Downloads/noaa/"
 mapVor = folium.Map(location=[40.75, -73.9], zoom_start=2)
+
+
+def mongo_connection():
+    try:
+        connection = MongoClient("mongodb://localhost:27017")
+        connection.database_names()
+        db = connection.database
+        crops = db.crops
+    except:
+        print("MongoDB connection has failed somehow...")
+        sys.exit(1)
+    return crops
+
 
 def send_dict_to_influx(data):
     for station in data:
@@ -104,6 +120,49 @@ def parse_data_temp(line):
     return temp
 
 
+def _region_centroid(vertices):
+    """
+    Finds the centroid of the voronoi region bounded by given vertices
+    See: https://en.wikipedia.org/wiki/Centroid#Centroid_of_polygon
+    :param vertices: list of vertices that bound the region
+    :type vertices: numpy array of vertices from the scipy.spatial.Voronoi.regions (e.g. vor.vertices[region + [region[0]], :])
+    :return: list of centroids
+    :rtype: np.array of centroids
+    """
+    signed_area = 0
+    C_x = 0
+    C_y = 0
+    for i in range(len(vertices)-1):
+        step = (vertices[i, 0]*vertices[i+1, 1])-(vertices[i+1, 0]*vertices[i, 1])
+        signed_area += step
+        C_x += (vertices[i, 0] + vertices[i+1, 0])*step
+        C_y += (vertices[i, 1] + vertices[i+1, 1])*step
+    signed_area = 1/2*signed_area
+    C_x = (1.0/(6.0*signed_area))*C_x
+    C_y = (1.0/(6.0*signed_area))*C_y
+    return np.array([[C_x, C_y]])
+
+
+def relax_points(vor, times=1):
+    """
+    Relaxes the points after an initial Voronoi is created to refine the graph.
+    See: https://stackoverflow.com/questions/17637244/voronoi-and-lloyd-relaxation-using-python-scipy
+    :param times: Number of times to relax, default is 1
+    :type times: int
+    :return: the final voronoi diagrama
+    :rtype: scipy.spatial.Voronoi
+    """
+    for i in range(times):
+        centroids = []
+        for region in vor.regions:
+            vertices = vor.vertices[region + [region[0]], :]
+            centroid = _region_centroid(vertices)
+            centroids.append(list(centroid[0, :]))
+        #self.points = centroids
+        vor = Voronoi(centroids)
+        return vor
+
+
 info_list = []
 coorddict = dict()
 coords = list()
@@ -159,11 +218,11 @@ for directory in directories:
                     # add the mean day temperature to the list of all day temps
                     first = True
 
+            # if there're not enough reported temperatures, we can skip this file
+            if len(all_temps) < 250:
+                break
             # sort all the year's daily temperatures
             all_temps.sort()
-            # if there's not any reported temperatures, we can skip this file
-            if not any(all_temps):
-                break
             # get a week's worth of coldest temps
             min_avg_temp = mean(all_temps[0:7])
             station_info = filename.strip('.out').split('-')
@@ -172,6 +231,7 @@ for directory in directories:
             infodict[station_info[0]]["DAILY_TEMPS"] = year_record
 
 tempdict = {}
+
 for key in infodict.keys():
     tempdict = get_station_info(key)
     lat = None
@@ -200,33 +260,50 @@ for key in infodict.keys():
 
 station_csv = open('station_temps.csv', 'w')
 print("id,lat,lon,temp".strip(), file=station_csv)
+
+# quick and dirty argument/db testing
+try:
+    if sys.argv[1] == "mongo":
+        mdb = mongo_connection()
+        mdb.insert_one(geohash)
+    elif sys.argv[1] == "influx":
+        send_dict_to_influx(infodict)
+except:
+    print("No args")
+
+
+
+# write a csv which contains the fields "id", "lat", "lon" and "temp"
+# "id" is name of the weather station, lat/lon are its coordinates, and "temp" is the min avg temp calculated above
 for station in coorddict.keys():
     print(",".join([str(station).strip(), str(coorddict[station]["lat"]), str(coorddict[station]["lon"]), str(coorddict[station]["temp"])]).strip(), file=station_csv)
     coords.append((coorddict[station]["lat"], coorddict[station]["lon"]))
 station_csv.close()
 
+# calculate voronoi geometry from all weather station coordinates
 vor = Voronoi(coords)
-#voronoi_plot_2d(vor)
-#The output file, to contain the Voronoi diagram we computed:
+
+# voronoi geometry geoJSON output file
 vorJSON = open('libVor.json', 'w')
 point_voronoi_list = []
 feature_list = []
 i = 0
+
 for region in range(len(vor.regions)-1):
     vertex_list = []
     for x in vor.regions[region]:
-        #Not sure how to map the "infinite" point, so, leave off those regions for now:
+        # not sure how to map the "infinite" point, so, leave off those regions for now:
         if x == -1:
             break
         else:
-            #Get the vertex out of the list, and flip the order for folium:
+            # remove vertex from list, and reorder for folium:
             vertex = vor.vertices[x]
             vertex = (vertex[1], vertex[0])
         vertex_list.append(vertex)
-    #Save the vertex list as a polygon and then add to the feature_list:
+    # save vertex list as a polygon and then add to the feature_list:
     polygon = Polygon([vertex_list])
+    # set IDs for each station in the voronoi geometry
     for entry in coorddict.keys():
-#        print(i, vor.points[i][0], vor.points[i][1], str(coorddict[entry]["lat"]), str(coorddict[entry]["lon"]))
         if vor.points[i][0] == coorddict[entry]["lat"] and vor.points[i][1] == coorddict[entry]["lon"]:
             id = entry
             break
@@ -271,10 +348,10 @@ vorJSON.close()
 #folium.GeoJson('libVor.json', name="geojson").add_to(mapVor)
 pd_stations = pd.read_csv('station_temps.csv', sep='\s*,\s*', encoding="utf-8-sig", delimiter=',')
 #print(pd_stations)
-mapVor.choropleth(geo_data='libVor.json', data=pd_stations, columns=['id', 'temp'], key_on='properties.id', fill_color="YlGn", fill_opacity=0.45, line_opacity=0.1)
+mapVor.choropleth(geo_data='libVor.json', data=pd_stations, columns=['id', 'temp'], key_on='properties.id',
+                  fill_color="BuPu", fill_opacity=0.45, line_opacity=0.1)
 folium.LayerControl().add_to(mapVor)
 mapVor.save(outfile='libVor.html')
 
-#send_dict_to_influx(infodict)
 
 
